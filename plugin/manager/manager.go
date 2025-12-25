@@ -95,6 +95,10 @@ func init() { // 插件主体
 		if err != nil {
 			panic(err)
 		}
+		err = db.Create("blocked", &blocked{})
+		if err != nil {
+			panic(err)
+		}
 	}()
 
 	// 升为管理
@@ -449,6 +453,10 @@ func init() { // 插件主体
 	engine.OnNotice().SetBlock(false).
 		Handle(func(ctx *zero.Ctx) {
 			if ctx.Event.NoticeType == "group_increase" && ctx.Event.SelfID != ctx.Event.UserID {
+				if db.CanFind("blocked", "WHERE gid = ? AND uid = ?", ctx.Event.GroupID, ctx.Event.UserID) {
+					ctx.SetThisGroupKick(ctx.Event.UserID, false)
+					return
+				}
 				var w welcome
 				err := db.Find("welcome", &w, "WHERE gid = ?", ctx.Event.GroupID)
 				if err == nil {
@@ -501,6 +509,19 @@ func init() { // 插件主体
 	engine.OnNotice().SetBlock(false).
 		Handle(func(ctx *zero.Ctx) {
 			if ctx.Event.NoticeType == "group_decrease" {
+				if ctx.Event.SelfID != ctx.Event.UserID {
+					c, ok := ctx.State["manager"].(*ctrl.Control[*zero.Ctx])
+					if ok {
+						enable := c.GetData(ctx.Event.GroupID)&0x20 == 0x20
+						if enable {
+							if err := c.Manager.DoBlock(ctx.Event.UserID); err != nil {
+								logrus.Warnln("[manager] auto block on group_decrease:", err)
+							} else {
+								_ = db.Insert("blocked", &blocked{GrpID: ctx.Event.GroupID, UID: ctx.Event.UserID, Time: time.Now().Unix()})
+							}
+						}
+					}
+				}
 				var w welcome
 				err := db.Find("farewell", &w, "WHERE gid = ?", ctx.Event.GroupID)
 				if err == nil {
@@ -616,11 +637,42 @@ func init() { // 插件主体
 			}
 			ctx.SendChain(message.Text("找不到服务!"))
 		})
+	// 退群自动拉黑开关
+	engine.OnRegex(`^(.*)退群自动拉黑$`, zero.OnlyGroup, zero.AdminPermission).SetBlock(true).
+		Handle(func(ctx *zero.Ctx) {
+			option := ctx.State["regex_matched"].([]string)[1]
+			c, ok := ctx.State["manager"].(*ctrl.Control[*zero.Ctx])
+			if ok {
+				data := c.GetData(ctx.Event.GroupID)
+				switch option {
+				case "开启", "打开", "启用":
+					data |= 0x20
+				case "关闭", "关掉", "禁用":
+					data &= 0x7fffffff_ffffffdf
+				default:
+					return
+				}
+				err := c.SetData(ctx.Event.GroupID, data)
+				if err == nil {
+					ctx.SendChain(message.Text("已", option))
+					return
+				}
+				ctx.SendChain(message.Text("出错啦: ", err))
+				return
+			}
+			ctx.SendChain(message.Text("找不到服务!"))
+		})
 	// 根据 gist 自动同意加群
 	// 加群请在github新建一个gist，其文件名为本群群号的字符串的md5(小写)，内容为一行，是当前unix时间戳(10分钟内有效)。
 	// 然后请将您的用户名和gist哈希(小写)按照username/gisthash的格式填写到回答即可。
 	engine.On("request/group/add").SetBlock(false).Handle(func(ctx *zero.Ctx) {
 		c, ok := ctx.State["manager"].(*ctrl.Control[*zero.Ctx])
+		if ok {
+			if db.CanFind("blocked", "WHERE gid = ? AND uid = ?", ctx.Event.GroupID, ctx.Event.UserID) {
+				ctx.SetGroupAddRequest(ctx.Event.Flag, "add", false, "已被拉黑")
+				return
+			}
+		}
 		if ok && c.GetData(ctx.Event.GroupID)&0x10 == 0x10 {
 			// gist 文件名是群号的 ascii 编码的 md5
 			// gist 内容是当前 uinx 时间戳，在 10 分钟内视为有效
